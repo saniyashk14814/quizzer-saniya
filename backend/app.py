@@ -2,10 +2,11 @@ import os
 import torch
 from flask import Flask, request, jsonify
 from transformers import (
-    GPT2LMHeadModel, 
-    GPT2Tokenizer, 
-    DistilBertForQuestionAnswering, 
-    DistilBertTokenizer
+    T5ForConditionalGeneration, 
+    T5Tokenizer,
+    BertForQuestionAnswering,
+    BertTokenizer,
+    pipeline
 )
 from PIL import Image
 import PyPDF2
@@ -75,119 +76,113 @@ class TextExtractor:
         image = Image.open(file_path)
         return pytesseract.image_to_string(image)
 
-
 class QuestionGenerator:
-    """Handles question generation using GPT-2"""
-
+    """Handles question generation using T5"""
+    
     def __init__(self):
         logger.info("Initializing QuestionGenerator...")
-        self.model = GPT2LMHeadModel.from_pretrained("distilgpt2")
-        self.tokenizer = GPT2Tokenizer.from_pretrained("distilgpt2")
-        self.max_chunk_length = 300  # Set maximum chunk length for input text
+        # Using T5 instead of GPT-2 as it's specifically fine-tuned for question generation
+        self.model = T5ForConditionalGeneration.from_pretrained("t5-base")
+        self.tokenizer = T5Tokenizer.from_pretrained("t5-base")
+        
+        # Set up QG pipeline
+        self.qg_pipeline = pipeline(
+            "text2text-generation", 
+            model=self.model, 
+            tokenizer=self.tokenizer
+        )
+        
+        self.max_length = 512
         logger.info("QuestionGenerator initialized successfully")
-
-    def preprocess_text(self, text):
-        """Split text into sentences, clean, and filter short sentences."""
-        sentences = sent_tokenize(text)
-        return [re.sub(r'\s+', ' ', sent.strip()) for sent in sentences if len(sent.split()) >= 5]
-
-    def chunk_text(self, text):
-        """Divide text into chunks of manageable length for model processing."""
-        words = text.split()
-        chunks = []
-        chunk = []
-
-        for word in words:
-            chunk.append(word)
-            if len(chunk) >= self.max_chunk_length:
-                chunks.append(' '.join(chunk))
-                chunk = []
-
-        # Add any remaining words as the last chunk
-        if chunk:
-            chunks.append(' '.join(chunk))
-
-        return chunks
-
+    
     def generate_questions(self, text, num_questions=5):
-        """Generate questions from the given text by chunking it into manageable parts."""
+        """Generate questions from the given text"""
         try:
-            cleaned_text = " ".join(self.preprocess_text(text))
-            text_chunks = self.chunk_text(cleaned_text)
+            sentences = self.preprocess_text(text)
             questions = []
-
-            for chunk in text_chunks[:num_questions]:  # Limit number of questions
-                # Create a prompt for question generation
-                prompt = f"Generate a question: {chunk}"
-                inputs = self.tokenizer.encode(prompt, return_tensors="pt", max_length=self.max_chunk_length, truncation=True)
-
-                # Generate question
-                outputs = self.model.generate(
-                    inputs,
-                    max_new_tokens=50,  # Control output length
-                    num_return_sequences=1,
-                    no_repeat_ngram_size=2,
-                    do_sample=True,
-                    top_k=50,
-                    top_p=0.95,
-                    temperature=0.7,
-                    pad_token_id=self.tokenizer.eos_token_id
-                )
-
-                question = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                questions.append({
-                    "question": question,
-                    "context": chunk
-                })
-
+            
+            for sentence in sentences[:num_questions]:
+                # T5 specific prompt format
+                prompt = f"generate question: {sentence}"
+                
+                try:
+                    # Generate question using T5
+                    output = self.qg_pipeline(
+                        prompt,
+                        max_length=64,
+                        num_return_sequences=1,
+                        do_sample=True,
+                        top_p=0.95,
+                        temperature=0.7
+                    )
+                    
+                    question = output[0]['generated_text']
+                    
+                    # Clean up and format the question
+                    question = question.strip()
+                    if not question.endswith("?"):
+                        question += "?"
+                    
+                    if len(question) < 10 or not any(word in question.lower() for word in ['what', 'when', 'where', 'who', 'how', 'why']):
+                        question =(sentence)
+                    
+                    questions.append({
+                        "question": question,
+                        "context": sentence
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"Error generating specific question: {str(e)}")
+                    questions.append({
+                        "question": self.generate_default_question(sentence),
+                        "context": sentence
+                    })
+            
             return questions
-
+            
         except Exception as e:
-            logger.error("Error generating questions: %s", str(e))
+            logger.error(f"Error generating questions: {str(e)}")
             raise
 
-
 class AnswerValidator:
-    """Handles answer validation using DistilBERT"""
+    """Handles answer validation using BERT"""
     
     def __init__(self):
         logger.info("Initializing AnswerValidator...")
-        self.model = DistilBertForQuestionAnswering.from_pretrained("distilbert-base-uncased-distilled-squad")
-        self.tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
+        # Using BERT instead of DistilBERT for better accuracy
+        self.model = BertForQuestionAnswering.from_pretrained("bert-large-uncased-whole-word-masking-finetuned-squad")
+        self.tokenizer = BertTokenizer.from_pretrained("bert-large-uncased-whole-word-masking-finetuned-squad")
+        
+        # Set up QA pipeline
+        self.qa_pipeline = pipeline(
+            "question-answering",
+            model=self.model,
+            tokenizer=self.tokenizer
+        )
         logger.info("AnswerValidator initialized successfully")
     
     def validate_answer(self, question, context, user_answer):
         """Validate user's answer against the model's prediction"""
         try:
-            # Encode the question and context
-            inputs = self.tokenizer(
-                question,
-                context,
-                return_tensors="pt",
-                max_length=512,
-                truncation=True
+            # Use the QA pipeline for prediction
+            result = self.qa_pipeline(
+                question=question,
+                context=context
             )
             
-            # Get the model's prediction
-            outputs = self.model(**inputs)
-            start_scores = outputs.start_logits
-            end_scores = outputs.end_logits
+            predicted_answer = result['answer']
+            confidence = result['score']
             
-            # Find the most likely answer span
-            start_idx = torch.argmax(start_scores)
-            end_idx = torch.argmax(end_scores)
+            # Compare with user's answer using more sophisticated matching
+            user_answer = user_answer.lower().strip()
+            predicted_answer = predicted_answer.lower().strip()
             
-            # Get the predicted answer
-            predicted_answer = self.tokenizer.decode(
-                inputs.input_ids[0][start_idx:end_idx+1],
-                skip_special_tokens=True
+            # Check for exact match or significant overlap
+            is_correct = (
+                predicted_answer in user_answer or 
+                user_answer in predicted_answer or
+                self._calculate_overlap(user_answer, predicted_answer) > 0.7
             )
-            
-            # Calculate confidence score
-            confidence = float(torch.max(start_scores) * torch.max(end_scores))
-            
-            # Compare with user's answer (simple string matching for now)
-            is_correct = predicted_answer.lower() in user_answer.lower() or user_answer.lower() in predicted_answer.lower()
             
             return {
                 "is_correct": is_correct,
@@ -198,7 +193,14 @@ class AnswerValidator:
         except Exception as e:
             logger.error(f"Error validating answer: {str(e)}")
             raise
-
+    
+    def _calculate_overlap(self, text1, text2):
+        """Calculate text overlap ratio"""
+        words1 = set(text1.split())
+        words2 = set(text2.split())
+        overlap = words1.intersection(words2)
+        return len(overlap) / max(len(words1), len(words2))
+    
 # Initialize Flask app
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = "uploads"
