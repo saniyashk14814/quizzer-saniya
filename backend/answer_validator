@@ -1,0 +1,27 @@
+from transformers import DistilBertForQuestionAnswering, DistilBertTokenizer
+import torch
+
+class AnswerValidator:
+    def __init__(self):
+        self.model = DistilBertForQuestionAnswering.from_pretrained("distilbert-base-uncased-distilled-squad")
+        self.tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
+
+    def validate_answer(self, question, context):
+        # Encode the question and context
+        inputs = self.tokenizer(question, context, return_tensors="pt")
+
+        # Get the answer
+        output = self.model(**inputs)
+        start_score = output.start_logits
+        end_score = output.end_logits
+
+        # Find the answer span
+        answer_start = torch.argmax(start_score)
+        answer_end = torch.argmax(end_score)
+        answer_tokens = inputs.input_ids[0][answer_start:answer_end+1]
+        answer = self.tokenizer.decode(answer_tokens, skip_special_tokens=True)
+
+        # Get the confidence score
+        confidence = torch.max(start_score) * torch.max(end_score)
+
+        return answer, confidence
